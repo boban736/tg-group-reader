@@ -1,0 +1,9 @@
+.env
+*.session
+*.session-journal
+state.json
+*.tmp
+reader.log
+launchd.out
+.venv/
+__pycache__/
