@@ -1,6 +1,7 @@
 """Hourly Telegram group digest: read new messages, let an LLM pick what matters,
 append it to a daily note in an Obsidian vault and ping Saved Messages about urgent items."""
 
+import argparse
 import asyncio
 import base64
 import datetime as dt
@@ -8,11 +9,11 @@ import io
 import json
 import logging
 import os
-import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import openai
 from dotenv import load_dotenv
 from openai import OpenAI
 from telethon import TelegramClient, functions
@@ -22,6 +23,8 @@ from telethon.tl.types import (
     MessageMediaDocument,
     MessageMediaPhoto,
 )
+
+import vault_out as vo
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
@@ -39,15 +42,26 @@ def env(name: str, default: str | None = None) -> str:
 API_ID = int(env("TG_API_ID"))
 API_HASH = env("TG_API_HASH")
 GROUP = env("TG_GROUP")  # @username, numeric id (-100...) or exact chat title
-OPENAI_MODEL = env("OPENAI_MODEL")
-OPENAI_API_KEY = env("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL") or None
+OPENAI_REASONING = os.getenv("OPENAI_REASONING", "low")  # none|low|medium|high, "" = model default
 
 VAULT_DIR = Path(env("VAULT_DIR")).expanduser()
-NOTES_DIR = VAULT_DIR / os.getenv("VAULT_NOTES_SUBDIR", "Универ/Дайджест")
-ATTACH_DIR = VAULT_DIR / os.getenv("VAULT_ATTACH_SUBDIR", "Универ/Дайджест/files")
-NOTE_TAGS = [t.strip() for t in os.getenv("NOTE_TAGS", "универ,дайджест").split(",") if t.strip()]
-SUBJECT_LINKS = os.getenv("SUBJECT_LINKS", "1") == "1"  # [[Предмет]] wikilinks
+LAYOUT = vo.Layout(
+    vault=VAULT_DIR,
+    digest_dir=VAULT_DIR / os.getenv("VAULT_DIGEST_SUBDIR", "Log/Telegram"),
+    log_dir=VAULT_DIR / os.getenv("VAULT_LOG_SUBDIR", "Log"),
+    courses_dir=VAULT_DIR / os.getenv("VAULT_COURSES_SUBDIR", "Courses"),
+    inbox_attach_dir=VAULT_DIR / os.getenv("VAULT_INBOX_ATTACH_SUBDIR", "Inbox/Telegram"),
+    deadlines_note=VAULT_DIR / os.getenv("VAULT_DEADLINES_NOTE", "Дедлайны.md"),
+    course_attach_sub=os.getenv("COURSE_ATTACH_SUBDIR", "Materials/Telegram"),
+    course_section=os.getenv("COURSE_SECTION", "## Из Telegram"),
+    tags=[t.strip() for t in os.getenv("NOTE_TAGS", "telegram").split(",") if t.strip()],
+)
+WRITE_LOG = os.getenv("WRITE_LOG", "1") == "1"
+WRITE_DEADLINES = os.getenv("WRITE_DEADLINES", "1") == "1"
+WRITE_COURSE_SECTIONS = os.getenv("WRITE_COURSE_SECTIONS", "1") == "1"
 SAVE_FILES_FOR = set(os.getenv("SAVE_FILES_FOR", "deadline,material,schedule,announcement").split(","))
 STATE_FILE = ROOT / "state.json"
 SESSION_FILE = ROOT / "tg.session"
@@ -63,15 +77,28 @@ IMAGE_DETAIL = os.getenv("IMAGE_DETAIL", "high")  # low | high | auto
 NOTIFY_URGENT = os.getenv("NOTIFY_URGENT", "1") == "1"
 NOTIFY_TARGET = os.getenv("NOTIFY_TARGET", "me")  # "me" = Saved Messages
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+IMAGE_EXTS = vo.IMAGE_EXTS
 TEXT_EXTS = {".txt", ".md", ".csv"}
 
-CATEGORY_TITLES = {
-    "deadline": "Дедлайны, тесты, экзамены",
-    "schedule": "Замены и изменения пар",
-    "material": "Файлы и материалы",
-    "announcement": "Объявления",
-    "other": "Прочее полезное",
+ITEM_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["items"],
+    "properties": {"items": {"type": "array", "items": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["category", "subject", "title", "summary", "when", "due", "urgent", "source_ids"],
+        "properties": {
+            "category": {"type": "string", "enum": list(vo.CATEGORY_TITLES)},
+            "subject": {"type": ["string", "null"]},
+            "title": {"type": ["string", "null"]},
+            "summary": {"type": "string"},
+            "when": {"type": ["string", "null"]},
+            "due": {"type": ["string", "null"]},
+            "urgent": {"type": "boolean"},
+            "source_ids": {"type": "array", "items": {"type": "integer"}},
+        },
+    }}},
 }
 
 
@@ -247,18 +274,20 @@ async def process_media(client, m, out: Msg) -> None:
     out.attachments.append(header)
 
 
-async def collect(client, chat, state: dict) -> tuple[list[Msg], int]:
+async def collect(client, chat, state: dict, since_hours: float | None = None) -> tuple[list[Msg], int]:
     key = str(chat.id)
-    last_id = state.get(key, {}).get("last_id", 0)
+    last_id = 0 if since_hours else state.get(key, {}).get("last_id", 0)
     admins = await fetch_admin_ids(client, chat)
     topics = await fetch_topics(client, chat)
 
     if last_id:
         raw = [m async for m in client.iter_messages(chat, min_id=last_id, limit=MAX_MESSAGES)]
     else:
-        since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=FIRST_RUN_HOURS)
+        hours = since_hours or FIRST_RUN_HOURS
+        limit = MAX_MESSAGES if not since_hours else max(MAX_MESSAGES, 5000)
+        since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
         raw = []
-        async for m in client.iter_messages(chat, limit=MAX_MESSAGES):
+        async for m in client.iter_messages(chat, limit=limit):
             if m.date < since:
                 break
             raw.append(m)
@@ -346,28 +375,64 @@ def batches(msgs: list[Msg]):
         yield cur
 
 
-def note_path(day: dt.date) -> Path:
-    return NOTES_DIR / f"{day:%Y-%m-%d}.md"
+LLM_FORMATS = [
+    {"type": "json_schema", "json_schema": {"name": "digest", "strict": True, "schema": ITEM_SCHEMA}},
+    {"type": "json_object"},
+    None,
+]
 
 
-def recent_digest_tail(chars: int = 4000) -> str:
-    today = dt.date.today()
-    text = "".join(
-        p.read_text() for p in (note_path(today - dt.timedelta(days=1)), note_path(today)) if p.exists())
-    return text[-chars:]
+def chat_completion(llm: OpenAI, messages: list[dict]) -> str:
+    """Chat Completions with Structured Outputs; falls back to json_object / plain text and
+    drops reasoning_effort if the model (or a proxy) rejects them."""
+    reasoning = OPENAI_REASONING
+    for fmt in LLM_FORMATS:
+        while True:
+            kwargs: dict = {"model": OPENAI_MODEL, "messages": messages}
+            if reasoning:
+                kwargs["reasoning_effort"] = reasoning
+            if fmt:
+                kwargs["response_format"] = fmt
+            try:
+                resp = llm.chat.completions.create(**kwargs)
+                return resp.choices[0].message.content or "{}"
+            except openai.BadRequestError as e:
+                msg = str(e)
+                if reasoning and "reasoning" in msg:
+                    log.warning("model rejects reasoning_effort, retrying without it")
+                    reasoning = ""
+                    continue
+                if fmt and ("response_format" in msg or "json" in msg.lower()):
+                    log.warning("response_format %s rejected: %s", fmt["type"], msg[:200])
+                    break
+                raise
+    raise RuntimeError("LLM rejected every response format")
 
 
-def ask_llm(llm: OpenAI, system: str, chat_title: str, pinned: str | None, batch: list[Msg]) -> list[dict]:
+def parse_items(raw: str) -> list[dict]:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`").removeprefix("json").strip()
+    try:
+        items = json.loads(raw).get("items", [])
+    except json.JSONDecodeError:
+        log.error("LLM returned invalid JSON: %s", raw[:500])
+        raise
+    return [i for i in items if isinstance(i, dict) and i.get("summary")]
+
+
+def ask_llm(llm: OpenAI, system: str, chat_title: str, pinned: str | None, batch: list[Msg],
+            earlier: list[dict]) -> list[dict]:
     now = dt.datetime.now().astimezone()
-    intro = [
-        f"Сейчас: {now:%A %d.%m.%Y %H:%M}.",
-        f"Группа: {chat_title}.",
-    ]
+    intro = [f"Сейчас: {now:%A %d.%m.%Y %H:%M}.", f"Группа: {chat_title}."]
     if pinned:
         intro.append(f"Закреплённое сообщение: {pinned}")
-    tail = recent_digest_tail()
+    tail = vo.recent_context(LAYOUT)
     if tail:
         intro.append("Уже записано в дайджест ранее (не повторяй это, если нет новых деталей):\n" + tail)
+    if earlier:
+        intro.append("Уже выбрано из предыдущих сообщений этого прогона (не повторяй):\n" + "\n".join(
+            f"- [{i.get('category')}] {i.get('subject') or ''}: {i.get('summary')}" for i in earlier))
     intro.append("Новые сообщения:\n\n" + "\n\n".join(render_msg(m) for m in batch))
 
     content: list[dict] = [{"type": "text", "text": "\n\n".join(intro)}]
@@ -376,79 +441,33 @@ def ask_llm(llm: OpenAI, system: str, chat_title: str, pinned: str | None, batch
             content.append({"type": "text", "text": f"Изображение из сообщения #{m.id}:"})
             content.append({"type": "image_url", "image_url": {"url": uri, "detail": IMAGE_DETAIL}})
 
-    resp = llm.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": content}],
-        response_format={"type": "json_object"},
-    )
-    raw = resp.choices[0].message.content or "{}"
-    try:
-        return json.loads(raw).get("items", [])
-    except json.JSONDecodeError:
-        log.error("LLM returned invalid JSON: %s", raw[:500])
-        raise
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": content}]
+    return parse_items(chat_completion(llm, messages))
+
+
+def build_system_prompt(courses: list[vo.Course]) -> str:
+    return PROMPT_FILE.read_text(encoding="utf-8") + "\n\n" + vo.courses_prompt(courses) + "\n"
 
 
 # ---------- output ----------
 
-def safe_name(name: str) -> str:
-    return re.sub(r'[\\/:*?"<>|#^\[\]]', "_", name).strip() or "file"
-
-
-def save_files(items: list[dict], msgs: dict[int, Msg]) -> dict[int, list[str]]:
-    """Save attachments of messages that useful items refer to; return msg id -> vault file names."""
-    saved: dict[int, list[str]] = {}
-    wanted = {mid for i in items if i.get("category", "other") in SAVE_FILES_FOR
-              for mid in i.get("source_ids", [])}
-    for mid in sorted(wanted):
-        m = msgs.get(mid)
-        if not m or not m.files:
-            continue
-        ATTACH_DIR.mkdir(parents=True, exist_ok=True)
-        for n, (name, data) in enumerate(m.files):
-            fname = safe_name(f"{m.date:%Y-%m-%d}_{m.id}_{n}_{name}" if name == "photo.jpg"
-                              else f"{m.date:%Y-%m-%d}_{m.id}_{name}")
-            (ATTACH_DIR / fname).write_bytes(data)
-            saved.setdefault(mid, []).append(fname)
-    return saved
-
-
-def write_digest(items: list[dict], msgs: dict[int, Msg], chat_title: str) -> None:
-    now = dt.datetime.now().astimezone()
-    path = note_path(now.date())
-    files = save_files(items, msgs)
-
-    parts = []
-    if not path.exists():
-        tags = "".join(f"\n  - {t}" for t in NOTE_TAGS)
-        parts.append(f"---\ndate: {now:%Y-%m-%d}\nsource: \"{chat_title}\"\ntags:{tags}\n---\n"
-                     f"\n# Дайджест {now:%d.%m.%Y}\n")
-    parts.append(f"\n## {now:%H:%M}\n")
-    for cat, title in CATEGORY_TITLES.items():
-        group = [i for i in items if i.get("category", "other") == cat]
-        if not group:
-            continue
-        parts.append(f"\n### {title}\n")
-        for i in group:
-            mark = "🔴 " if i.get("urgent") else ""
-            subj = i.get("subject")
-            subj = f"[[{subj}]]: " if subj and SUBJECT_LINKS else (f"{subj}: " if subj else "")
-            when = f" — **{i['when']}**" if i.get("when") else ""
-            ids = [mid for mid in i.get("source_ids", []) if mid in msgs]
-            refs = " ".join(f"[#{mid}]({msgs[mid].link})" for mid in ids)
-            parts.append(f"- {mark}{subj}{i.get('summary', '').strip()}{when} {refs}".rstrip() + "\n")
-            for mid in ids:
-                for fname in files.get(mid, []):
-                    embed = "!" if Path(fname).suffix.lower() in IMAGE_EXTS else ""
-                    parts.append(f"\t- {embed}[[{fname}]]\n")
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as f:
-        f.write("".join(parts))
+def write_vault(items: list[dict], msgs: dict[int, Msg], chat_title: str, dry_run: bool) -> vo.VaultWriter:
+    w = vo.VaultWriter(VAULT_DIR, dry_run=dry_run)
+    run_at = dt.datetime.now().astimezone()
+    files = vo.save_files(w, LAYOUT, items, msgs, SAVE_FILES_FOR)
+    per_day = vo.write_digests(w, LAYOUT, items, msgs, files, chat_title, run_at)
+    if WRITE_LOG:
+        vo.write_log_line(w, LAYOUT, items, per_day, run_at)
+    new_deadlines = vo.write_deadlines(w, LAYOUT, items, msgs, run_at.date()) if WRITE_DEADLINES else None
+    if WRITE_COURSE_SECTIONS:
+        vo.write_course_sections(w, LAYOUT, items, msgs, files, new_deadlines)
+    w.flush()
+    return w
 
 
 async def notify(client, items: list[dict], chat_title: str, msgs: dict[int, Msg]) -> None:
-    urgent = [i for i in items if i.get("urgent")]
+    today = dt.date.today()
+    urgent = [i for i in items if i.get("urgent") and not ((d := vo.parse_due(i)) and d < today)]
     if not (NOTIFY_URGENT and urgent):
         return
     lines = [f"🔴 {chat_title}:"]
@@ -461,23 +480,42 @@ async def notify(client, items: list[dict], chat_title: str, msgs: dict[int, Msg
 
 # ---------- main ----------
 
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--login", action="store_true", help="only log in to Telegram and check the group")
+    p.add_argument("--days", type=float, help="re-read the last N days (ignores state; for backfill)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the vault diff instead of writing; no state update, no notifications")
+    p.add_argument("--no-notify", action="store_true", help="do not send urgent items to Saved Messages")
+    return p.parse_args()
+
+
 async def main() -> None:
+    args = parse_args()
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
         handlers=[logging.StreamHandler(), logging.FileHandler(ROOT / "reader.log")],
     )
-    system = PROMPT_FILE.read_text()
-    llm = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+    if not args.login and not (OPENAI_MODEL and OPENAI_API_KEY):
+        sys.exit("Missing OPENAI_MODEL / OPENAI_API_KEY in .env")
     state = load_state()
 
     async with TelegramClient(str(SESSION_FILE), API_ID, API_HASH) as client:
         chat = await resolve_chat(client)
         title = getattr(chat, "title", GROUP)
-        msgs, new_last = await collect(client, chat, state)
+        if args.login:
+            print(f"OK: logged in, group {title!r} (id {chat.id}, forum={getattr(chat, 'forum', False)})")
+            return
+
+        courses = vo.load_courses(LAYOUT.courses_dir)
+        system = build_system_prompt(courses)
+        llm = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+        since_hours = args.days * 24 if args.days else None
+        msgs, new_last = await collect(client, chat, state, since_hours)
         if not msgs:
             log.info("no new messages")
-            if new_last:
-                state[str(chat.id)] = {"last_id": new_last}
+            if new_last and not args.dry_run:
+                state[str(chat.id)] = {"last_id": max(new_last, state.get(str(chat.id), {}).get("last_id", 0))}
                 save_state(state)
             return
 
@@ -486,14 +524,22 @@ async def main() -> None:
         by_id = {m.id: m for m in msgs}
         items: list[dict] = []
         for b in batches(msgs):
-            items.extend(ask_llm(llm, system, title, pinned, b))
+            items.extend(ask_llm(llm, system, title, pinned, b, items))
+        for i in items:
+            i["_course"] = vo.match_course(i.get("subject"), courses)
 
         if items:
-            write_digest(items, by_id, title)
-            await notify(client, items, title, by_id)
-        log.info("%d items written", len(items))
+            w = write_vault(items, by_id, title, args.dry_run)
+            if args.dry_run:
+                print(w.diff() or "(no changes)")
+            elif not args.no_notify:
+                await notify(client, items, title, by_id)
+        log.info("%d items %s", len(items), "found (dry run)" if args.dry_run else "written")
+        if args.dry_run:
+            return
         # Advance only after a successful run so a failure is retried next hour.
-        state[str(chat.id)] = {"last_id": new_last}
+        prev = state.get(str(chat.id), {}).get("last_id", 0)
+        state[str(chat.id)] = {"last_id": max(new_last, prev)}
         save_state(state)
 
 
