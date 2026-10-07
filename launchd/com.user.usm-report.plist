@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.user.usm-report</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__DIR__/.venv/bin/python</string>
+    <string>__DIR__/send_report.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>__DIR__</string>
+  <!-- отчёт пишется в 11:25; отправка один раз, повторы ловят задержку/сон Mac -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>32</integer></dict>
+    <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>5</integer></dict>
+    <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
+  <key>StandardOutPath</key><string>__DIR__/launchd.out</string>
+  <key>StandardErrorPath</key><string>__DIR__/launchd.out</string>
+</dict>
+</plist>

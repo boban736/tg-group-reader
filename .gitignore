@@ -7,3 +7,4 @@ reader.log
 launchd.out
 .venv/
 __pycache__/
+report_sent.json
